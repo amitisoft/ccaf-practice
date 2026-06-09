@@ -1,4 +1,4 @@
-## Exercise 3: Build a Structured Data Extraction Pipeline
+## Exercise 2: Build a Structured Data Extraction Pipeline
 
 **Objective:** Practice using tool use with JSON schemas, validation-retry loops, few-shot examples, nullable fields, and human review routing.
 
