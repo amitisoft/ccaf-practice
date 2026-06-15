@@ -1,0 +1,441 @@
+# Coding Exercise: Product Review Intelligence Pipeline
+
+**Domains:** 4 (Prompt Engineering & Structured Output) + 5 (Context Management & Reliability)  
+**Time:** ~1 hour with Claude Code  
+**Stack:** Python 3.10+ + Anthropic SDK  
+
+---
+
+## Scenario
+
+You work at an e-commerce company. Your team receives hundreds of free-text product reviews
+daily. Legal and operations need structured insight: what product is being reviewed, what
+specific issues are raised, and how confident the system is in each extraction. Low-confidence
+extractions and reviews with conflicting signals must be flagged for a human moderator.
+
+You are building the extraction pipeline from scratch.
+
+---
+
+## What you will build
+
+A Python script (`pipeline.py`) that:
+
+1. **Extracts structured data** from each review using `tool_use` with a JSON schema
+2. **Handles nullable fields** — not every review mentions price, delivery time, or return experience
+3. **Validates** that extracted sentiment score is consistent with the star rating; retries with specific error feedback when it isn't
+4. **Manages context** across a batch of 10 reviews — trimming tool outputs to relevant fields only before they accumulate
+5. **Routes** low-confidence extractions to a human review queue, with a structured handoff summary
+6. **Preserves provenance** — every extracted claim carries the source review ID
+
+---
+
+## Setup (5 min)
+
+```bash
+mkdir review-pipeline && cd review-pipeline
+python -m venv .venv && source .venv/bin/activate
+pip install anthropic
+export ANTHROPIC_API_KEY=your_key_here
+touch pipeline.py reviews.py
+```
+
+Open the project in Claude Code:
+
+```bash
+claude
+```
+
+---
+
+## Sample data
+
+Paste this into `reviews.py` — your pipeline will process these 10 reviews.
+
+```python
+# reviews.py
+REVIEWS = [
+    {
+        "id": "R001",
+        "stars": 5,
+        "text": "Absolutely love this espresso machine. Setup took about 10 minutes, the crema is perfect, and it arrived two days early. Worth every penny at $299."
+    },
+    {
+        "id": "R002",
+        "stars": 2,
+        "text": "The blender worked great for the first week then started making a grinding noise. Customer service took 4 days to respond and still hasn't resolved it. Very disappointed."
+    },
+    {
+        "id": "R003",
+        "stars": 4,
+        "text": "Nice headphones overall. Sound quality is excellent, battery lasts about 30 hours. Slight issue with the headband being a bit tight at first but it loosened up."
+    },
+    {
+        "id": "R004",
+        "stars": 1,
+        "text": "DO NOT BUY. This product is dangerous. The charging cable got extremely hot and left a burn mark on my desk. I've filed a report with the manufacturer."
+    },
+    {
+        "id": "R005",
+        "stars": 3,
+        "text": "It's fine. Does what it says. Nothing special but nothing broken either."
+    },
+    {
+        "id": "R006",
+        "stars": 5,
+        "text": "I was skeptical at first but the air purifier has genuinely reduced my allergy symptoms. Running it in the bedroom every night for 3 weeks now. Filter replacement looks easy too."
+    },
+    {
+        "id": "R007",
+        "stars": 2,
+        "text": "Came damaged in shipping. The box was clearly crushed. Waiting on a replacement but the return process has been a nightmare — three different chat agents, each asked me to start over."
+    },
+    {
+        "id": "R008",
+        "stars": 4,
+        "text": "Great kitchen scale. Accurate to 0.1g which is what I needed for coffee. Only complaint is the display is hard to read in bright light. Fast delivery, good packaging."
+    },
+    {
+        "id": "R009",
+        "stars": 1,
+        "text": "This is not the product shown in the photo. I ordered the white version and received grey. When I complained I was told 'colors may vary due to screen settings.' That's not acceptable for a $180 purchase."
+    },
+    {
+        "id": "R010",
+        "stars": 3,
+        "text": "Works as advertised but the instructions are only in German and French. Had to find a YouTube tutorial. Once I figured it out it's actually pretty good."
+    }
+]
+```
+
+---
+
+## Part 1 — Schema + Extraction (20 min)
+
+### Your task
+
+Define an `extract_review` tool with a JSON schema and use `tool_use` to extract structured
+data from each review.
+
+**Schema fields to include:**
+
+| Field | Type | Required? | Notes |
+|---|---|---|---|
+| `product_category` | string | yes | e.g. "kitchen appliance", "audio" |
+| `sentiment_score` | number | yes | -1.0 (very negative) to 1.0 (very positive) |
+| `issues` | array of strings | yes | Empty array if none — never null |
+| `price_mentioned` | number or null | no | Exact dollar amount if stated, otherwise null |
+| `delivery_mentioned` | boolean or null | no | true/false if delivery was discussed, null if not mentioned |
+| `safety_concern` | boolean | yes | true if any physical danger is described |
+| `confidence` | number | yes | 0.0–1.0 — model's confidence in this extraction |
+
+**Key exam concepts to apply:**
+
+- Use `tool_choice={"type": "tool", "name": "extract_review"}` to force structured output
+- Make `price_mentioned` and `delivery_mentioned` nullable — don't add them to `required`
+- `issues` should be required but default to `[]` (empty array), not null
+- `safety_concern` must always be present — never nullable
+
+**Starter structure for `pipeline.py`:**
+
+```python
+import json
+import time
+import anthropic
+from reviews import REVIEWS
+
+client = anthropic.Anthropic()
+
+EXTRACTION_TOOL = {
+    "name": "extract_review",
+    "description": "Extract structured insight from a product review.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            # TODO: define your fields here
+            # Example structure:
+            # "product_category": {
+            #     "type": "string",
+            #     "description": "..."
+            # },
+        },
+        "required": [
+            # TODO: list only fields that must always be present
+        ]
+    }
+}
+
+
+def extract_review(review: dict, error_context: str | None = None) -> dict:
+    user_content = f"Review ID: {review['id']}\nStar rating: {review['stars']}/5\n\n{review['text']}"
+
+    if error_context:
+        user_content = f"{error_context}\n\n---\n\nOriginal review:\n{user_content}"
+
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1000,
+        tools=[EXTRACTION_TOOL],
+        tool_choice={"type": "tool", "name": "extract_review"},  # TODO: confirm this is correct
+        messages=[
+            {"role": "user", "content": user_content}
+        ]
+    )
+
+    # TODO: pull the structured data out of response.content
+    # Hint: iterate response.content and find the block where block.type == "tool_use"
+    # The extracted data is in block.input (already a dict — no json.loads needed)
+    for block in response.content:
+        if block.type == "tool_use":
+            return block.input
+
+    raise ValueError(f"No tool_use block found in response for review {review['id']}")
+
+
+if __name__ == "__main__":
+    # Test on first 3 reviews
+    for review in REVIEWS[:3]:
+        result = extract_review(review)
+        print(f"\n--- {review['id']} ---")
+        print(json.dumps(result, indent=2))
+```
+
+**Run with:**
+```bash
+python pipeline.py
+```
+
+**Check:** Does R004 (the dangerous charging cable) have `safety_concern: true`?  
+Does R005 ("It's fine") have `price_mentioned: null` and `delivery_mentioned: null`?
+
+---
+
+## Part 2 — Validation + Retry (20 min)
+
+### Your task
+
+A 5-star review should never have `sentiment_score < 0`. A 1-star review should never have
+`sentiment_score > 0`. When the extracted score contradicts the star rating, retry with
+specific error feedback — not a generic "try again."
+
+**Key exam concepts to apply:**
+
+- Retry-with-error-feedback: the follow-up call must pass `error_context` containing the
+  original review text, the failed extraction (as JSON), and the specific mismatch
+  (e.g. `"You returned sentiment_score: 0.3 but this is a 1-star review — the score must be negative"`)
+- Know when NOT to retry: if `confidence < 0.4`, the model is uncertain about the review
+  itself — retrying won't help. Log it and move on.
+- Max 1 retry per review
+
+**Add these functions to `pipeline.py`:**
+
+```python
+def validate_extraction(extraction: dict, review: dict) -> list[str]:
+    errors = []
+
+    # TODO: check sentiment_score vs star rating
+    # Stars 4–5 → score should be > 0
+    # Stars 1–2 → score should be < 0
+    # Star 3 → either direction is acceptable
+
+    # TODO: check sentiment_score is within -1.0 to 1.0
+    # TODO: check confidence is within 0.0 to 1.0
+
+    return errors  # empty list = valid
+
+
+def extract_with_retry(review: dict) -> dict:
+    first_attempt = extract_review(review)
+    errors = validate_extraction(first_attempt, review)
+
+    if not errors:
+        return {**first_attempt, "review_id": review["id"], "retried": False}
+
+    # Don't retry if confidence is too low — the model is uncertain about the source material
+    if first_attempt.get("confidence", 1.0) < 0.4:
+        print(f"[{review['id']}] Low confidence ({first_attempt.get('confidence')}) — skipping retry")
+        return {**first_attempt, "review_id": review["id"], "retried": False, "validation_errors": errors}
+
+    # TODO: build error_context string that includes:
+    # 1. The specific validation error(s)
+    # 2. The failed extraction as formatted JSON
+    # Be specific — "sentiment_score was 0.3 but must be negative for a 1-star review"
+    error_context = (
+        f"Your previous extraction had the following errors:\n"
+        # TODO: add error details
+        f"\nYour previous (incorrect) extraction was:\n"
+        f"{json.dumps(first_attempt, indent=2)}\n"
+        f"\nPlease correct these errors."
+    )
+
+    print(f"[{review['id']}] Retrying with error feedback: {errors}")
+    second_attempt = extract_review(review, error_context=error_context)
+    return {**second_attempt, "review_id": review["id"], "retried": True}
+```
+
+**Check:** Does R004 (1-star, dangerous cable) produce a negative sentiment score?  
+Does R006 (5-star, air purifier) produce a positive sentiment score?
+
+---
+
+## Part 3 — Context Management + Human Review Queue (20 min)
+
+### Your task
+
+Process all 10 reviews. Two problems to solve:
+
+**Problem A — Context bloat:**  
+If you naively store full extraction dicts, verbose fields accumulate unnecessarily.
+Trim each result to only the fields needed for downstream processing before appending
+to your results list.
+
+**Problem B — Human review routing:**  
+Reviews with `confidence < 0.6` OR `safety_concern: True` must go to a human moderator queue.
+The handoff must include enough context for a moderator who has never seen the conversation.
+
+**Key exam concepts to apply:**
+
+- Trim verbose tool outputs before they accumulate (Domain 5, Task 5.1)
+- Structured handoff summaries with all context a human needs (Domain 5)
+- Provenance: every item in the queue must carry `review_id` so the moderator can find the source
+
+**Add this to `pipeline.py`:**
+
+```python
+human_review_queue: list[dict] = []
+processed_results: list[dict] = []
+
+
+def trim_for_context(extraction: dict) -> dict:
+    # TODO: return only the fields needed downstream.
+    # Keep: review_id, sentiment_score, issues, safety_concern, confidence
+    # Drop: product_category, price_mentioned, delivery_mentioned, retried, validation_errors
+    # This prevents verbose fields from bloating your results list.
+    pass
+
+
+def route_to_human_review(extraction: dict, original_review: dict) -> None:
+    # TODO: build a structured handoff dict with:
+    # - review_id              (provenance — links back to source)
+    # - reason                 ("low_confidence" | "safety_concern" | "both")
+    # - original_text          (so the human has full context without the conversation)
+    # - extracted_data         (so they don't start from scratch)
+    # - recommended_action     ("verify_extraction" | "escalate_to_safety_team")
+    handoff = {
+        # TODO
+    }
+    human_review_queue.append(handoff)
+
+
+def process_batch() -> None:
+    for review in REVIEWS:
+        extraction = extract_with_retry(review)
+
+        low_confidence = extraction.get("confidence", 1.0) < 0.6
+        safety_flag = extraction.get("safety_concern", False) is True
+
+        if low_confidence or safety_flag:
+            route_to_human_review(extraction, review)
+
+        # TODO: trim before storing
+        processed_results.append(trim_for_context(extraction))
+
+        time.sleep(0.5)  # avoid rate limiting
+
+    print(f"\n=== BATCH COMPLETE ===")
+    print(f"Processed: {len(processed_results)}")
+    print(f"Human review queue: {len(human_review_queue)}")
+    print(f"\nHuman Review Queue:")
+    print(json.dumps(human_review_queue, indent=2))
+
+
+if __name__ == "__main__":
+    process_batch()
+```
+
+**Check:**
+- R004 (safety concern) should appear in the queue with `reason` containing `"safety_concern"` and `recommended_action: "escalate_to_safety_team"`
+- R005 ("It's fine") may appear if confidence is low
+- Every item in the queue has `review_id` set correctly
+
+---
+
+## Success criteria
+
+Work through this checklist when you're done:
+
+### Domain 4 — Prompt Engineering & Structured Output
+- [ ] `tool_choice` forces the specific tool by name, not `"auto"`
+- [ ] `price_mentioned` and `delivery_mentioned` are NOT in the `required` list
+- [ ] `issues` defaults to `[]`, not `None`, when no issues are mentioned
+- [ ] Retry `error_context` includes: the failed extraction as JSON + a specific description of the mismatch
+- [ ] Retry is skipped when `confidence < 0.4` (retrying won't fix a model uncertainty problem)
+- [ ] R004 extracts `safety_concern: True` on first attempt
+
+### Domain 5 — Context Management & Reliability
+- [ ] `trim_for_context()` drops unused fields before results accumulate
+- [ ] Human review queue items include `review_id` (provenance)
+- [ ] Human review queue items include `original_text` (human has full context)
+- [ ] `reason` field distinguishes between `"low_confidence"`, `"safety_concern"`, and `"both"`
+- [ ] `recommended_action` is `"escalate_to_safety_team"` for safety concerns, `"verify_extraction"` for low confidence only
+- [ ] No review is silently dropped — every review ends up in either `processed_results` or `human_review_queue`
+
+---
+
+## Stretch goals (if time allows)
+
+**Stretch 1 — Conflict detection (Domain 5, Task 5.6)**  
+R009 is a 1-star review but the customer paid $180, implying they expected quality.
+Add a `conflict_detected` boolean to your schema that flags when sentiment and implied
+purchase satisfaction are contradictory. Include it in the human review handoff.
+
+**Stretch 2 — Message Batches API (Domain 4, Task 4.5)**  
+Rewrite `process_batch()` to use the Anthropic Message Batches API instead of sequential
+requests. Use `review["id"]` as the `custom_id`. Then poll for completion and handle
+failed items by identifying them via `custom_id` and resubmitting with truncated text.
+
+```python
+# Hint: batch creation looks like this
+batch = client.messages.batches.create(
+    requests=[
+        {
+            "custom_id": review["id"],
+            "params": {
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 1000,
+                "tools": [EXTRACTION_TOOL],
+                "tool_choice": {"type": "tool", "name": "extract_review"},
+                "messages": [{"role": "user", "content": review["text"]}]
+            }
+        }
+        for review in REVIEWS
+    ]
+)
+# Then poll: client.messages.batches.results(batch.id)
+```
+
+**Stretch 3 — Accuracy by segment (Domain 5, Task 5.5)**  
+After processing all 10, manually label which extractions are correct. Compare accuracy
+for `confidence >= 0.8` vs `confidence < 0.8`. Does the model's self-reported confidence
+correlate with actual accuracy? Print a simple breakdown:
+
+```python
+high_conf = [r for r in processed_results if r.get("confidence", 0) >= 0.8]
+low_conf  = [r for r in processed_results if r.get("confidence", 0) < 0.8]
+print(f"High confidence extractions: {len(high_conf)}")
+print(f"Low confidence extractions:  {len(low_conf)}")
+```
+
+---
+
+## What this covers on the exam
+
+| Exam task statement | Where in this exercise |
+|---|---|
+| 4.1 — Explicit criteria to reduce false positives | Validation: specific mismatch error message, not a generic "try again" |
+| 4.3 — Enforce structured output via tool_use + JSON schema | Part 1: schema design, forced `tool_choice` |
+| 4.4 — Validation, retry, and feedback loops | Part 2: retry with error feedback; skip retry on low confidence |
+| 4.5 — Batch processing strategies | Stretch 2: Message Batches API with `custom_id` |
+| 5.1 — Manage context to preserve critical information | Part 3: `trim_for_context()`, provenance on all queue items |
+| 5.5 — Human review workflows + confidence calibration | Part 3: routing logic, structured handoff |
+| 5.6 — Information provenance in multi-source synthesis | `review_id` on every queue item; Stretch 1 conflict detection |
