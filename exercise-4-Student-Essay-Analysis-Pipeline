@@ -1,0 +1,774 @@
+# Coding Exercise: Student Essay Analysis Pipeline
+
+**Domains:** 1 (Agentic Architecture & Orchestration) + 4 (Prompt Engineering & Structured Output)
+**Scenario:** Education — automated essay feedback
+**Time:** ~1 hour with Claude Code
+**Stack:** Python 3.10+ + Anthropic SDK
+
+---
+
+## Concepts you will practise
+
+This exercise is designed around specific exam task statements. Each part of the
+exercise maps to one or more concepts you will be tested on.
+
+### Domain 1 — Agentic Architecture & Orchestration
+
+| Concept | Where in this exercise |
+|---|---|
+| **Agentic loop lifecycle** — inspecting `stop_reason`, executing tools, returning results | Part 1: the main grading loop |
+| **Coordinator-subagent pattern** — hub-and-spoke, task decomposition, result aggregation | Part 2: coordinator delegates to 3 specialist subagents |
+| **Explicit context passing** — subagents do not inherit parent context automatically | Part 2: each subagent receives the essay text directly in its prompt |
+| **Parallel subagent execution** — multiple Task tool calls in a single coordinator response | Part 2 stretch: spawn all 3 subagents in one turn |
+| **PostToolUse hooks** — intercept tool results before the model processes them | Part 3: normalise score formats across subagents |
+| **Programmatic enforcement** — hooks provide deterministic guarantees; prompts do not | Part 3: hook blocks invalid score ranges before they reach the aggregator |
+
+### Domain 4 — Prompt Engineering & Structured Output
+
+| Concept | Where in this exercise |
+|---|---|
+| **JSON schema with `tool_use`** — force structured output, eliminate syntax errors | Part 1: rubric extraction tool |
+| **Required vs nullable fields** — prevent hallucination of absent data | Part 1: `improvement_example` is nullable; scores are required |
+| **`tool_choice` forced selection** — guarantee the model calls a specific tool | Part 1: `tool_choice={"type": "tool", "name": "grade_essay"}` |
+| **Few-shot examples** — achieve consistent feedback tone and format | Part 2: subagent prompts include 2 examples |
+| **Explicit criteria over vague instructions** — reduce inconsistent outputs | Part 2: each subagent has specific, testable criteria |
+| **Validation-retry with error feedback** — specific mismatch description on retry | Part 3: component scores must sum within range of overall score |
+
+---
+
+## Scenario
+
+You are building an automated essay feedback system for a secondary school. Teachers
+submit student essays and receive a structured assessment report: scores across three
+dimensions (content, structure, language), specific strengths and weaknesses, and
+actionable suggestions for improvement.
+
+The system must be consistent — the same essay should receive the same score
+regardless of when it is submitted — and never fabricate examples that do not appear
+in the essay.
+
+---
+
+## Setup (5 min)
+
+```bash
+mkdir essay-pipeline && cd essay-pipeline
+python -m venv .venv && source .venv/bin/activate
+pip install anthropic
+export ANTHROPIC_API_KEY=your_key_here
+touch pipeline.py essays.py
+```
+
+Open in Claude Code:
+```bash
+claude
+```
+
+---
+
+## Sample data
+
+Paste this into `essays.py`. Your pipeline will process all four essays.
+
+```python
+# essays.py
+
+ESSAYS = [
+    {
+        "id": "E001",
+        "student": "Amara",
+        "grade_level": 10,
+        "prompt": "Should schools ban smartphones in classrooms? Argue your position.",
+        "text": """
+Smartphones should be banned from classrooms because they are a major source of
+distraction. When students have their phones out, they are tempted to check social
+media, play games, or text their friends instead of paying attention. Studies have
+shown that even the presence of a phone on a desk reduces cognitive capacity,
+even if the phone is face down and silent.
+
+Some people argue that smartphones are useful educational tools that can be used
+to look things up or access learning apps. While this is true, the benefits do not
+outweigh the costs. Teachers already have computers and tablets available for
+research tasks. Smartphones add no unique value that cannot be provided through
+existing school technology.
+
+Furthermore, banning phones teaches students an important lesson about delayed
+gratification and focus — skills they will need throughout their lives. A student
+who can concentrate for 45 minutes without checking their phone is better prepared
+for university and the workplace than one who cannot.
+
+For these reasons, schools should implement a full smartphone ban during class hours,
+with phones stored in lockers or in a classroom phone pouch during lessons.
+        """.strip()
+    },
+    {
+        "id": "E002",
+        "student": "Ben",
+        "grade_level": 10,
+        "prompt": "Should schools ban smartphones in classrooms? Argue your position.",
+        "text": """
+I think phones are good and bad. They can help you look things up but also they
+distract you. My teacher always tells us to put our phones away but we don't always
+listen. I think it depends on the student really. Some students can handle having
+a phone and some can't. The school should maybe have a policy but also trust students.
+
+Also phones can be important for safety. If there is an emergency you need to be
+able to contact your parents. So banning them completely seems too extreme.
+
+In conclusion phones have good and bad sides and schools need to think carefully
+about what to do.
+        """.strip()
+    },
+    {
+        "id": "E003",
+        "student": "Priya",
+        "grade_level": 10,
+        "prompt": "Should schools ban smartphones in classrooms? Argue your position.",
+        "text": """
+The question of smartphone use in educational settings sits at the intersection of
+pedagogical effectiveness, digital literacy, and student autonomy. I will argue that
+outright bans are a blunt instrument that fails to address the underlying issue, and
+that a structured, teacher-mediated approach to phone use produces better outcomes.
+
+First, the evidence on smartphone distraction is real but contextual. A 2019 study
+by Kuznekoff and Titsworth found that students who used phones during lectures scored
+significantly lower on assessments. However, these effects were mediated by the
+*type* of use: passive scrolling was far more harmful than active note-taking or
+research. A ban treats these uses as equivalent, which the evidence does not support.
+
+Second, smartphones are increasingly the primary device through which young people
+access information, communicate, and participate in civic life. Schools that ban
+them entirely miss an opportunity to teach responsible digital citizenship — a skill
+gap that becomes apparent when students leave the structured school environment.
+
+Third, implementation of bans is inconsistent and contested. Schools in low-income
+areas often lack the infrastructure for enforced phone collection, and
+disproportionate enforcement creates additional equity concerns.
+
+A more effective policy would establish clear, lesson-specific norms: phones away
+during direct instruction, permitted during research or collaborative tasks, with
+teacher discretion to adapt. This teaches students to manage their attention rather
+than simply removing the temptation.
+        """.strip()
+    },
+    {
+        "id": "E004",
+        "student": "Carlos",
+        "grade_level": 10,
+        "prompt": "Should schools ban smartphones in classrooms? Argue your position.",
+        "text": """
+Schools should not ban smartphones. Phones are useful because you can use them to
+look things up on Google and also for calculators. Also if you forget your homework
+you can photograph it. My friend uses his phone to record the teacher explaining
+things so he can watch it again later which is very helpful.
+
+Banning phones would be unfair to students who use them responsibly. Not everyone
+is distracted by phones. Some people are more focused when they have their phone
+nearby because they are not worried about missing messages.
+
+The real problem is not phones but boring lessons. If lessons were more interesting
+students would not want to look at their phones. So teachers should make better
+lessons instead of banning phones.
+
+Also in the real world everyone uses phones for work so students should learn to
+use them professionally while at school.
+        """.strip()
+    }
+]
+```
+
+---
+
+## Part 1 — Agentic Loop + Structured Extraction (15 min)
+
+### Concepts: agentic loop lifecycle, JSON schema, tool_choice, required vs nullable fields
+
+### Your task
+
+Build the core grading loop. On each API call, inspect `stop_reason` to decide whether
+to execute the requested tool or return the final result. Use `tool_use` with a forced
+`tool_choice` to guarantee structured output.
+
+**Schema fields:**
+
+| Field | Type | Required? | Notes |
+|---|---|---|---|
+| `overall_score` | integer | yes | 1–10 |
+| `content_score` | integer | yes | 1–10: quality of argument and evidence |
+| `structure_score` | integer | yes | 1–10: organisation, paragraphing, flow |
+| `language_score` | integer | yes | 1–10: vocabulary, grammar, sentence variety |
+| `strengths` | array of strings | yes | Min 1 item; specific to this essay |
+| `weaknesses` | array of strings | yes | Min 1 item; specific to this essay |
+| `improvement_suggestion` | string | yes | One concrete, actionable next step |
+| `improvement_example` | string or null | no | A rewritten sentence/phrase from the essay — null if no clear example applies |
+| `grade_justified` | boolean | yes | Does the overall_score reflect the component scores? |
+
+**Key exam concept:** `improvement_example` is nullable because not every essay has
+a sentence that illustrates the improvement clearly. Making it required would pressure
+the model to fabricate an example. `strengths` and `weaknesses` are required arrays —
+never null — because every essay has both.
+
+```python
+# pipeline.py
+import json
+import time
+import anthropic
+from essays import ESSAYS
+
+client = anthropic.Anthropic()
+
+# ── TOOL DEFINITION ──────────────────────────────────────────────────────────
+
+GRADING_TOOL = {
+    "name": "grade_essay",
+    "description": (
+        "Grade a student essay against a rubric. "
+        "Return scores for each dimension and specific, actionable feedback. "
+        "improvement_example must be a direct quote or close paraphrase from the "
+        "essay — never invented. Return null if no suitable example exists."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            # TODO: define all fields from the table above
+            # Remember: improvement_example should NOT be in required
+        },
+        "required": [
+            # TODO: list all required fields
+        ]
+    }
+}
+
+SYSTEM_PROMPT = """You are an experienced secondary school English teacher.
+Grade student essays fairly and consistently. Be specific — always reference
+the actual essay content in your feedback. Never invent quotes or examples
+that do not appear in the essay.
+
+Scoring guide:
+1-3: Below expectations — major gaps in the criterion
+4-5: Approaching expectations — partial achievement with clear gaps
+6-7: Meeting expectations — solid work with some room to improve
+8-9: Exceeding expectations — strong work, minor refinements possible
+10:  Exceptional — publishable quality for this age group"""
+
+
+# ── AGENTIC LOOP ─────────────────────────────────────────────────────────────
+
+def grade_essay(essay: dict, extra_context: str | None = None) -> dict:
+    """
+    Run the agentic grading loop for a single essay.
+    Continues iterating while stop_reason == "tool_use".
+    Terminates when stop_reason == "end_turn".
+    """
+    user_content = (
+        f"Grade Level: {essay['grade_level']}\n"
+        f"Essay Prompt: {essay['prompt']}\n\n"
+        f"Student Essay:\n{essay['text']}"
+    )
+    if extra_context:
+        user_content = f"{extra_context}\n\n---\n\n{user_content}"
+
+    messages = [{"role": "user", "content": user_content}]
+
+    # TODO: implement the agentic loop
+    # Key steps:
+    # 1. Call client.messages.create() with the grading tool and forced tool_choice
+    # 2. Check response.stop_reason
+    # 3. If "tool_use": find the tool_use block, extract block.input, return it
+    # 4. If "end_turn": the model returned text instead of using the tool — this
+    #    should not happen with forced tool_choice, but handle it gracefully
+    # 5. Append assistant response and tool result to messages for next iteration
+    #    (for this single-tool task, the loop will complete in one iteration)
+
+    while True:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            system=SYSTEM_PROMPT,
+            tools=[GRADING_TOOL],
+            tool_choice={"type": "tool", "name": "grade_essay"},
+            messages=messages
+        )
+
+        # TODO: inspect response.stop_reason and handle each case
+        # Hint: response.stop_reason will be "tool_use" since we forced the tool
+        # Find the tool_use block: next(b for b in response.content if b.type == "tool_use")
+        pass
+
+
+if __name__ == "__main__":
+    for essay in ESSAYS[:2]:
+        print(f"\n{'='*60}")
+        print(f"Grading {essay['id']} — {essay['student']}")
+        result = grade_essay(essay)
+        print(json.dumps(result, indent=2))
+        time.sleep(1)
+```
+
+**Check your work:**
+- E003 (Priya) should score higher than E002 (Ben) on all dimensions
+- E001 and E003 should both have non-null `improvement_example` (they have quotable sentences)
+- E002's `improvement_example` may be null (the essay is vague)
+- All scores should be integers between 1 and 10
+
+---
+
+## Part 2 — Multi-Agent Coordinator with Few-Shot Prompting (25 min)
+
+### Concepts: coordinator-subagent pattern, explicit context passing, few-shot examples, explicit criteria
+
+### Your task
+
+Replace the single grading call with a coordinator that delegates to three specialist
+subagents — one per dimension — then aggregates their findings. Each subagent must
+receive the essay text explicitly. They do not share context.
+
+**Architecture:**
+```
+Coordinator
+├── content_agent    → grades argument quality and evidence
+├── structure_agent  → grades organisation and paragraph flow
+└── language_agent   → grades vocabulary, grammar, sentence variety
+```
+
+**Key exam concept:** Each subagent gets only the tools and context relevant to its
+role. The coordinator passes the essay text directly in each subagent prompt — it
+cannot assume subagents inherit anything from the coordinator's session.
+
+### Subagent tool schemas
+
+Each subagent has its own focused tool:
+
+```python
+# Add these to pipeline.py
+
+CONTENT_TOOL = {
+    "name": "assess_content",
+    "description": "Assess the quality of argument and evidence in a student essay.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "score": {
+                "type": "integer",
+                "description": "Content score 1-10. Flag ONLY: unsupported claims, "
+                               "logical fallacies, missing counter-argument engagement. "
+                               "Do NOT flag: writing style, grammar, paragraph length."
+            },
+            "strengths": {"type": "array", "items": {"type": "string"}},
+            "weaknesses": {"type": "array", "items": {"type": "string"}},
+            "has_counter_argument": {
+                "type": "boolean",
+                "description": "True if the essay acknowledges and responds to an opposing view."
+            }
+        },
+        "required": ["score", "strengths", "weaknesses", "has_counter_argument"]
+    }
+}
+
+STRUCTURE_TOOL = {
+    "name": "assess_structure",
+    "description": "Assess the organisational structure and flow of a student essay.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "score": {
+                "type": "integer",
+                "description": "Structure score 1-10. Flag ONLY: missing introduction or "
+                               "conclusion, unclear paragraph focus, abrupt transitions. "
+                               "Do NOT flag: argument quality or word choice."
+            },
+            "strengths": {"type": "array", "items": {"type": "string"}},
+            "weaknesses": {"type": "array", "items": {"type": "string"}},
+            "has_clear_conclusion": {"type": "boolean"}
+        },
+        "required": ["score", "strengths", "weaknesses", "has_clear_conclusion"]
+    }
+}
+
+LANGUAGE_TOOL = {
+    "name": "assess_language",
+    "description": "Assess vocabulary, grammar, and sentence variety in a student essay.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "score": {
+                "type": "integer",
+                "description": "Language score 1-10. Flag ONLY: grammatical errors, "
+                               "repetitive sentence structure, imprecise word choice. "
+                               "Do NOT flag: argument quality or paragraph organisation."
+            },
+            "strengths": {"type": "array", "items": {"type": "string"}},
+            "weaknesses": {"type": "array", "items": {"type": "string"}},
+            "notable_vocabulary": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Up to 3 impressive or poorly-chosen words/phrases — "
+                               "direct quotes only, never invented."
+            }
+        },
+        "required": ["score", "strengths", "weaknesses", "notable_vocabulary"]
+    }
+}
+```
+
+**Key exam concept — explicit criteria:** Notice each tool description says
+"Flag ONLY" and "Do NOT flag". This prevents each subagent from drifting into
+the other agents' territory. Vague instructions like "assess the writing quality"
+would cause each agent to evaluate everything, producing contradictory scores.
+
+### Few-shot examples
+
+Each subagent system prompt should include 2 few-shot examples demonstrating
+the correct score range and feedback style. This is how you achieve consistent
+output across different essays and model calls.
+
+```python
+CONTENT_SYSTEM = """You are a specialist in evaluating argumentative writing.
+Assess ONLY the quality of the argument and evidence. Do not comment on grammar
+or paragraph structure — those are assessed separately.
+
+Scoring criteria for content:
+- Does the essay take a clear position?
+- Are claims supported with evidence or reasoning?
+- Does it engage with the opposing view?
+- Are there logical fallacies or unsupported assertions?
+
+Examples of calibrated scoring:
+
+Example 1 — Score 8:
+Essay extract: "Research by the University of Texas found that students who kept
+phones on their desks scored 20% lower on tests, even with phones face-down.
+This suggests the mere presence of a device impairs focus."
+Assessment: Clear claim, specific cited evidence, causal reasoning explained.
+Score: 8 — strong evidence use, minor gap: no counter-argument addressed.
+
+Example 2 — Score 4:
+Essay extract: "Phones are distracting and everyone knows this. Students always
+get distracted when they have phones."
+Assessment: Claim present but no evidence, circular reasoning, no acknowledgment
+of opposing views.
+Score: 4 — position clear but entirely unsupported."""
+
+STRUCTURE_SYSTEM = """You are a specialist in essay organisation and flow.
+Assess ONLY paragraph structure, transitions, and overall organisation.
+Do not comment on argument quality or vocabulary.
+
+Scoring criteria for structure:
+- Does the essay have a clear introduction that states a position?
+- Is each paragraph focused on a single idea?
+- Are transitions between paragraphs logical and smooth?
+- Does the conclusion summarise and close effectively?
+
+Examples of calibrated scoring:
+
+Example 1 — Score 9:
+Essay has: clear thesis in para 1, each body paragraph with topic sentence and
+development, signposting language ("Furthermore", "However", "In contrast"),
+conclusion that synthesises rather than merely repeats.
+Score: 9 — excellent organisation, minor refinement possible in transition variety.
+
+Example 2 — Score 5:
+Essay has: no clear introduction (jumps straight to first point), two paragraphs
+that cover the same idea, no concluding paragraph — ends abruptly.
+Score: 5 — readable but lacks formal essay structure."""
+
+LANGUAGE_SYSTEM = """You are a specialist in written language quality.
+Assess ONLY vocabulary, grammar, and sentence variety.
+Do not comment on argument strength or essay organisation.
+
+Scoring criteria for language:
+- Is grammar consistently accurate?
+- Is vocabulary precise and appropriate for the grade level?
+- Does sentence length and structure vary, or is it repetitive?
+- Are there any notable examples of strong or weak word choice?
+
+Examples of calibrated scoring:
+
+Example 1 — Score 8:
+Uses: "pedagogical effectiveness", "mediated by", "disproportionate enforcement"
+accurately and in context. Mix of complex and simple sentences. One minor
+comma splice in paragraph 3.
+Score: 8 — sophisticated vocabulary, mostly accurate grammar.
+
+Example 2 — Score 3:
+Uses: "good and bad", "things", "very helpful" — imprecise throughout.
+All sentences follow subject-verb-object pattern with no variation.
+Three agreement errors ("they is", "students was").
+Score: 3 — limited vocabulary range, frequent grammatical errors."""
+```
+
+### Coordinator implementation
+
+```python
+def run_subagent(tool: dict, system: str, essay: dict) -> dict:
+    """
+    Run a single specialist subagent.
+    Receives essay text explicitly — no shared context with coordinator.
+    """
+    # TODO: call client.messages.create() with the subagent's tool and system prompt
+    # Pass the essay text directly in the user message
+    # Use tool_choice to force the specific tool
+    # Return the tool_use block's input dict
+    pass
+
+
+def coordinate_grading(essay: dict) -> dict:
+    """
+    Coordinator: delegates to three subagents and aggregates results.
+
+    Key exam concept: the coordinator calls each subagent with explicit context.
+    Subagents do not share memory. Each prompt must be self-contained.
+    """
+    print(f"  → Running content subagent...")
+    content = run_subagent(CONTENT_TOOL, CONTENT_SYSTEM, essay)
+    time.sleep(0.5)
+
+    print(f"  → Running structure subagent...")
+    structure = run_subagent(STRUCTURE_TOOL, STRUCTURE_SYSTEM, essay)
+    time.sleep(0.5)
+
+    print(f"  → Running language subagent...")
+    language = run_subagent(LANGUAGE_TOOL, LANGUAGE_SYSTEM, essay)
+
+    # TODO: aggregate subagent results into a single report dict
+    # Compute overall_score as a weighted average:
+    #   content: 40%, structure: 30%, language: 30%
+    # Round to nearest integer
+    # Include all subagent findings in the aggregated result
+
+    return {
+        "essay_id": essay["id"],
+        "student": essay["student"],
+        # TODO: add overall_score, component scores, aggregated strengths/weaknesses
+    }
+
+
+if __name__ == "__main__":
+    for essay in ESSAYS:
+        print(f"\n{'='*60}")
+        print(f"Processing {essay['id']} — {essay['student']}")
+        report = coordinate_grading(essay)
+        print(json.dumps(report, indent=2))
+        time.sleep(1)
+```
+
+**Check your work:**
+- Each subagent function call should receive the essay text directly in its prompt
+- E003 (Priya) should score highest overall — her essay uses cited research and addresses counter-arguments
+- E002 (Ben) should score lowest — vague argument, no evidence, weak structure
+- Content scores should NOT penalise grammar (that belongs to language)
+
+---
+
+## Part 3 — PostToolUse Hook + Validation Retry (20 min)
+
+### Concepts: PostToolUse hooks, programmatic enforcement, validation-retry with error feedback
+
+### Your task
+
+Add two reliability layers on top of the coordinator:
+
+**Layer A — PostToolUse hook:** After each subagent call, intercept the result and
+verify the score is within the valid range (1–10). If not, correct it programmatically
+before the aggregator sees it. This is deterministic — it cannot fail the way a prompt
+instruction could.
+
+**Layer B — Validation-retry:** After aggregating subagent scores, verify that the
+computed `overall_score` is consistent with the component scores (within ±1 point of
+the weighted average). If not, retry the *aggregation* step with specific error feedback.
+
+**Key exam concept — hooks vs prompts:** You could add "always return scores between
+1 and 10" to each subagent's system prompt. But this is probabilistic — the model may
+still occasionally return 0 or 11. A hook that clamps scores programmatically is
+deterministic. Use hooks for business rules that must never be violated.
+
+```python
+# ── POST-TOOL-USE HOOK ───────────────────────────────────────────────────────
+
+def post_tool_use_hook(tool_name: str, result: dict) -> dict:
+    """
+    Intercept subagent tool results before they reach the aggregator.
+    Enforces business rules that prompts alone cannot guarantee.
+    """
+    # TODO: implement score range enforcement
+    # If result["score"] < 1, clamp to 1 and log a warning
+    # If result["score"] > 10, clamp to 10 and log a warning
+    # Return the (potentially corrected) result
+    #
+    # Key exam concept: this is the PostToolUse hook pattern.
+    # It runs AFTER the tool executes but BEFORE the aggregator processes the result.
+    print(f"  [hook] post_tool_use: {tool_name}, score={result.get('score')}")
+    return result  # TODO: replace with clamping logic
+
+
+# ── VALIDATION ───────────────────────────────────────────────────────────────
+
+def validate_report(report: dict) -> list[str]:
+    """
+    Validate the aggregated report for internal consistency.
+    Returns a list of error strings (empty = valid).
+    """
+    errors = []
+
+    # TODO: compute expected_overall as weighted average of component scores
+    # content: 40%, structure: 30%, language: 30%
+    # If abs(report["overall_score"] - expected_overall) > 1.0, add an error:
+    # "overall_score is X but weighted component average is Y (content=A, structure=B, language=C)"
+
+    # TODO: check that strengths and weaknesses lists are non-empty
+
+    # TODO: check overall_score is between 1 and 10
+
+    return errors
+
+
+def aggregate_with_retry(essay: dict, content: dict, structure: dict, language: dict) -> dict:
+    """
+    Aggregate subagent results with validation and one retry if scores are inconsistent.
+
+    Key exam concept: retry-with-error-feedback.
+    The retry prompt must include the specific inconsistency, not just "try again".
+    """
+    # First aggregation attempt
+    report = build_report(essay, content, structure, language)
+    errors = validate_report(report)
+
+    if not errors:
+        return report
+
+    # Build a specific error context — not a generic "try again"
+    error_context = (
+        f"The previous aggregation had the following consistency errors:\n"
+        + "\n".join(f"- {e}" for e in errors)
+        + f"\n\nComponent scores were: "
+        + f"content={content['score']}, structure={structure['score']}, language={language['score']}"
+        + f"\nPlease recalculate overall_score as: round(content*0.4 + structure*0.3 + language*0.3)"
+    )
+
+    print(f"  [retry] Aggregation inconsistency: {errors}")
+
+    # TODO: re-run aggregation with error_context injected
+    # Hint: you can either re-call the model with the error context,
+    # or for a purely mathematical correction like this one, compute it
+    # programmatically — which is actually MORE reliable than a retry.
+    # Which approach is better here, and why?
+
+    return report  # TODO: return corrected report
+
+
+def build_report(essay: dict, content: dict, structure: dict, language: dict) -> dict:
+    """
+    Assemble the final report from subagent outputs.
+    Called by aggregate_with_retry.
+    """
+    # TODO: compute overall_score as weighted average (content 40%, structure 30%, language 30%)
+    # Combine strengths and weaknesses from all three subagents
+    # Include has_counter_argument, has_clear_conclusion, notable_vocabulary
+    return {}
+```
+
+**Update `coordinate_grading` to use the hook and validator:**
+
+```python
+def coordinate_grading(essay: dict) -> dict:
+    print(f"  → Running content subagent...")
+    content_raw = run_subagent(CONTENT_TOOL, CONTENT_SYSTEM, essay)
+    content = post_tool_use_hook("assess_content", content_raw)  # hook
+    time.sleep(0.5)
+
+    print(f"  → Running structure subagent...")
+    structure_raw = run_subagent(STRUCTURE_TOOL, STRUCTURE_SYSTEM, essay)
+    structure = post_tool_use_hook("assess_structure", structure_raw)  # hook
+    time.sleep(0.5)
+
+    print(f"  → Running language subagent...")
+    language_raw = run_subagent(LANGUAGE_TOOL, LANGUAGE_SYSTEM, essay)
+    language = post_tool_use_hook("assess_language", language_raw)  # hook
+
+    return aggregate_with_retry(essay, content, structure, language)
+```
+
+**Reflection question (answer in a comment in your code):**
+
+> In `aggregate_with_retry`, you could retry the model with error feedback, OR
+> you could simply compute the correct `overall_score` programmatically from the
+> component scores. Which is more appropriate here, and what exam principle does
+> your answer reflect?
+
+---
+
+## Success criteria
+
+### Domain 1 — Agentic Architecture & Orchestration
+- [ ] The agentic loop in `grade_essay` checks `stop_reason` and only terminates on `"end_turn"`
+- [ ] `run_subagent` passes essay text directly in the prompt — it does not rely on shared context
+- [ ] `post_tool_use_hook` intercepts tool results *before* aggregation, not after
+- [ ] The hook clamps scores programmatically — it does not add a prompt instruction to fix the score
+- [ ] Each subagent only receives the tool relevant to its role (content tool to content agent, etc.)
+
+### Domain 4 — Prompt Engineering & Structured Output
+- [ ] `tool_choice` forces the specific tool by name on every API call
+- [ ] `improvement_example` is NOT in the `required` array
+- [ ] Each subagent system prompt includes 2 few-shot scoring examples
+- [ ] Each subagent description says "Flag ONLY" and "Do NOT flag" with specific exclusions
+- [ ] The validation-retry error message names the specific mismatch (actual vs expected score) — not "invalid result"
+- [ ] E003 (Priya) scores at least 2 points higher than E002 (Ben) on content
+
+---
+
+## Stretch goals
+
+**Stretch 1 — Parallel subagent execution (Domain 1, Task 1.3)**
+Modify `coordinate_grading` to spawn all three subagents in a single batch rather than
+sequentially. Use `asyncio` and `asyncio.gather` or Python's `ThreadPoolExecutor`. Measure
+the latency improvement. This maps to the exam concept of emitting multiple Task tool calls
+in a single coordinator response.
+
+```python
+import asyncio
+
+async def run_subagent_async(tool, system, essay):
+    # TODO: wrap run_subagent in an async function
+    pass
+
+async def coordinate_grading_parallel(essay):
+    content_task = run_subagent_async(CONTENT_TOOL, CONTENT_SYSTEM, essay)
+    structure_task = run_subagent_async(STRUCTURE_TOOL, STRUCTURE_SYSTEM, essay)
+    language_task = run_subagent_async(LANGUAGE_TOOL, LANGUAGE_SYSTEM, essay)
+
+    content, structure, language = await asyncio.gather(
+        content_task, structure_task, language_task
+    )
+    # apply hooks, then aggregate...
+```
+
+**Stretch 2 — Scratchpad persistence (Domain 5, Task 5.4)**
+After grading all 4 essays, write a `scratchpad.json` file containing the key findings
+for each essay (scores and top weakness per dimension). Then simulate a session resumption
+by reading the scratchpad and generating a class-wide improvement report — without
+re-grading any essay.
+
+**Stretch 3 — Human review routing (Domain 5, Task 5.5)**
+Route essays to a human review queue when:
+- Any two subagents disagree by more than 3 points on their respective scores
+- The content subagent flags no counter-argument (`has_counter_argument: False`) but
+  the overall score is above 7 — suggesting the model may have been too generous
+
+---
+
+## Exam concept map
+
+| Exam task statement | Implemented in |
+|---|---|
+| 1.1 — Agentic loop: stop_reason, tool execution, loop control | Part 1: `grade_essay` loop |
+| 1.2 — Coordinator-subagent: hub-and-spoke, task decomposition | Part 2: `coordinate_grading` |
+| 1.3 — Subagent context passing: explicit prompts, no inheritance | Part 2: `run_subagent` passes essay text directly |
+| 1.3 — Parallel subagent execution | Stretch 1: `asyncio.gather` |
+| 1.5 — PostToolUse hooks: deterministic enforcement | Part 3: `post_tool_use_hook` |
+| 1.5 — Hooks vs prompt instructions | Part 3: reflection question |
+| 4.1 — Explicit criteria: "Flag ONLY" / "Do NOT flag" | Part 2: subagent descriptions |
+| 4.2 — Few-shot examples: score calibration, format consistency | Part 2: subagent system prompts |
+| 4.3 — tool_use with JSON schema: forced tool_choice, nullable fields | Part 1 & 2: all tool definitions |
+| 4.4 — Validation-retry: specific error feedback, retry limits | Part 3: `aggregate_with_retry` |
+| 5.4 — Scratchpad files: persist findings across sessions | Stretch 2 |
+| 5.5 — Human review routing: confidence-based escalation | Stretch 3 |
